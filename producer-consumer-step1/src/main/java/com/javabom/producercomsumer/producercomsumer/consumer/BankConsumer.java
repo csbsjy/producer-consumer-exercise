@@ -19,7 +19,6 @@ public class BankConsumer<T extends PaymentEvent> {
         new Thread(this::consume).start();
     }
 
-    // 스레드는 하나만 쓰고있다.
     private void consume() {
         while (true) {
             try {
