@@ -70,23 +70,148 @@ public BankConsumer(EventBroker<T> eventBroker, Consumer<T> consumer) {
 
 
 
-저는 Springframework 에서 지원하는 ThreadPoolTaskExecutor 를 사용했습니다. 
+저는 Springframework 에서 지원하는 [ThreadPoolTaskExecutor](https://docs.spring.io/spring/docs/4.1.x/javadoc-api/org/springframework/scheduling/concurrent/ThreadPoolTaskExecutor.html) 를 사용했습니다. 
 
 ThreadPoolTaskExecutor 는 아래와 같은 속성을 가지고 있습니다.
 
 ```java
-private int corePoolSize = 1;
-private int maxPoolSize = Integer.MAX_VALUE;
-private int keepAliveSeconds = 60;
-private int queueCapacity = Integer.MAX_VALUE;
-private boolean allowCoreThreadTimeOut = false;
+private int corePoolSize = 1; // 평상시 pool size
+private int maxPoolSize = Integer.MAX_VALUE; 
+private int keepAliveSeconds = 60; // core pool size에서 늘어나고 난 뒤 지속되는 시간
+private int queueCapacity = Integer.MAX_VALUE; // queue 사이즈가 이만큼 차면 최대 max pool size까지 늘어난다
+private boolean allowCoreThreadTimeOut = false; // true로 설정 하면 keepAliveSeconds에 의해 CoreThread도 제거된다.
+```
+
+ThreadPoolTaskExecutor는 ThreadPoolExecutor와 유사핮미나 JMX를 통해 런타임 모니터링을 수행하며 쓰레드풀을 관리하는기능을 가집니다.
+Java docs를 보면 'This setting can be modified at runtime, for example through JMX.This setting can be modified at runtime, for example through JMX.' 문구를 심심치않게 볼 수 있습니다.
+
+
+
+
+요구사항에서 이벤트 별 스레드 조건이 다를 수 있다고 했기 때문에 두 개의 ThreadPoolTaskExecutor 빈을 설정하겠습니다.
+
+```java
+@Configuration
+public class ThreadPoolConfig {
+    @Bean
+    public ThreadPoolTaskExecutor cardEventThreadPool() {
+        ThreadPoolTaskExecutor taskExecutor = new ThreadPoolTaskExecutor();
+        taskExecutor.setCorePoolSize(2);
+//        taskExecutor.setQueueCapacity(1);
+        taskExecutor.setThreadGroupName("카드결제이벤트그룹");
+        return taskExecutor;
+    }
+
+    @Bean
+    public ThreadPoolTaskExecutor cashEventThreadPool() {
+        ThreadPoolTaskExecutor taskExecutor = new ThreadPoolTaskExecutor();
+        taskExecutor.setCorePoolSize(1);
+//        taskExecutor.setQueueCapacity(1);
+        taskExecutor.setThreadGroupName("현금결제이벤트그룹");
+        return taskExecutor;
+    }
+
+}
+```
+
+당장은 스레드가 늘어나기 바라지 않기 때문에 setQueueCapacity를 주석처리 해주었습니다.(기본값은 정수 맥스)
+
+
+
+이제 이 스레드 풀을 사용하도록 Consumer를 수정하겠습니다. 
+제 첫번째 코드입니다. 이 코드에는 치명적인 결함이 있습니다.
+
+
+```java
+@Slf4j
+public class BankConsumer<T extends PaymentEvent> {
+
+    private final EventBroker<T> eventBroker;
+    private final Consumer<T> consumer;
+
+    public BankConsumer(EventBroker<T> eventBroker, Consumer<T> consumer, ThreadPoolTaskExecutor executor) {
+        this.eventBroker = eventBroker;
+        this.consumer = consumer;
+        executor.execute(this::consume);
+    }
+
+    private void consume() {
+        while (true) {
+            try {
+                T paymentEvent = this.eventBroker.poll();
+                this.consumer.accept(paymentEvent);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+}
 ```
 
 
 
 
 
-이벤트 별 스레드 조건이 다르기 때문에 두 개의 ThreadPoolTaskExecutor 빈을 설정합니다.
+저는 스레드풀을 사용은 했지만 제대로 쓰진 않았습니다.
+
+위 코드는 기존의 new Thread().start()를 ThreadPool.execute()로만 변경한 것인데, 조금만 살펴보면 스레드 풀에서 스레드 하나만 꺼내서 계속 while문만 돌리는 것을 알 수 있습니다. 즉, <u>요청이 많아져도 스레드풀의 이점을 전혀 살릴 수없는 코드</u>였습니다.
+
+
+
+
+
+정말 바보같은 실수임을 깨닫고 다음처럼 변경했습니다.
+
+
+
+```java
+private final EventBroker<T> eventBroker;
+    private final Consumer<T> consumer;
+    private final ThreadPoolTaskExecutor executor;
+
+    public BankConsumer(EventBroker<T> eventBroker, Consumer<T> consumer, ThreadPoolTaskExecutor executor) {
+        this.eventBroker = eventBroker;
+        this.consumer = consumer;
+        this.executor = executor;
+        new Thread(this::consume).start();
+    }
+
+    private void consume() {
+        while (true) {
+            try {
+                T paymentEvent = this.eventBroker.poll();
+                executor.execute(() -> consumer.accept(paymentEvent));
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+```
+
+
+
+하나의 스레드가 eventBroker에서 event를 꺼내고, ThreadPool에서 Thread를 꺼내 event를 넘겨주게 되었습니다. event를 poll하는 스레드가 프로세스가되고, 그 프로세스의 스레드가 된 것입니다.
+
+
+
+![image](https://user-images.githubusercontent.com/47847993/80439415-70688900-8941-11ea-96a0-b3a8b6eb853f.png)
+
+
+
+실행 후 로그를보면 카드결제는 2개의 스레드(entThreadPool-2, 1) 현금결제는 1개의 스레드를 사용하는 것을 볼 수 있습니다. 설정 시 현금결제는 coreThreadPool을 1로 뒀기 때문입니다.
+
+
+
+리뷰때 이야기를 했던 내용 중, EventBroker가 동기화되지 않는 Queue를 가지고 있어도 되는지에 대한 주제가 있었습니다. 현재 코드에서 EventBroker는 아래와 같은 LinkedList 큐를 가지고 있습니다.
+
+```java
+private final Queue<T> eventQueue = new LinkedList<>();
+```
+
+
+
+
+
 
 
 
